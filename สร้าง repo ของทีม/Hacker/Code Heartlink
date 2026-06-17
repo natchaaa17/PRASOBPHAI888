@@ -1,0 +1,135 @@
+#include <Wire.h>
+#include "MAX30105.h"
+#include "spo2_algorithm.h"
+
+MAX30105 particleSensor;
+
+#define BUFFER_LENGTH 100
+#define FINGER_THRESHOLD 10000  // ไม่มีนิ้ว ~700, มีนิ้ว ~130000
+
+uint32_t irBuffer[BUFFER_LENGTH];
+uint32_t redBuffer[BUFFER_LENGTH];
+
+int32_t spo2, heartRate;
+int8_t validSPO2, validHeartRate;
+
+// Moving average
+#define AVG_SIZE 5
+int32_t bpmHistory[AVG_SIZE];
+int32_t spo2History[AVG_SIZE];
+uint8_t histIndex = 0;
+uint8_t histCount = 0;
+
+// เพิ่มตัวแปร filter ไว้บนสุด
+float filterIR = 0;
+float filterRed = 0;
+const float alpha = 0.5; // ยิ่งต่ำยิ่ง smooth
+
+// ฟังก์ชัน filter
+uint32_t applyFilter(float &f, uint32_t val) {
+  f = alpha * f + (1.0 - alpha) * val;
+  return (uint32_t)f;
+}
+
+void addHistory(int32_t bpm, int32_t sp) {
+  bpmHistory[histIndex] = bpm;
+  spo2History[histIndex] = sp;
+  histIndex = (histIndex + 1) % AVG_SIZE;
+  if (histCount < AVG_SIZE) histCount++;
+}
+
+float avgBPM() {
+  float s = 0;
+  for (uint8_t i = 0; i < histCount; i++) s += bpmHistory[i];
+  return s / histCount;
+}
+
+float avgSpO2() {
+  float s = 0;
+  for (uint8_t i = 0; i < histCount; i++) s += spo2History[i];
+  return s / histCount;
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22);
+
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("MAX30102 not found!");
+    while (1);
+  }
+
+  particleSensor.setup(30, 4, 2, 50, 411, 4096);
+  Serial.println("Ready. Place finger on sensor...");
+}
+
+void loop() {
+  // เก็บ buffer
+  for (byte i = 0; i < BUFFER_LENGTH; i++) {
+    while (!particleSensor.available())
+      particleSensor.check();
+
+    redBuffer[i] = applyFilter(filterRed, particleSensor.getRed());
+    irBuffer[i]  = applyFilter(filterIR,  particleSensor.getIR());
+    particleSensor.nextSample();
+  }
+
+  // เช็คนิ้ว
+  if (irBuffer[BUFFER_LENGTH - 1] < FINGER_THRESHOLD) {
+    Serial.println("[ No Finger ] วางนิ้วบนเซ็นเซอร์...");
+    histCount = 0;
+    histIndex = 0;
+    delay(500);
+    return;
+  }
+
+  // คำนวณครั้งแรก
+  maxim_heart_rate_and_oxygen_saturation(
+    irBuffer, BUFFER_LENGTH, redBuffer,
+    &spo2, &validSPO2, &heartRate, &validHeartRate
+  );
+
+  while (1) {
+    // sliding window
+    for (byte i = 25; i < BUFFER_LENGTH; i++) {
+      redBuffer[i - 25] = redBuffer[i];
+      irBuffer[i - 25]  = irBuffer[i];
+    }
+
+    for (byte i = 75; i < BUFFER_LENGTH; i++) {
+      while (!particleSensor.available())
+        particleSensor.check();
+      redBuffer[i] = particleSensor.getRed();
+      irBuffer[i]  = particleSensor.getIR();
+      particleSensor.nextSample();
+    }
+
+    // เช็คนิ้วหลุด
+    if (irBuffer[BUFFER_LENGTH - 1] < FINGER_THRESHOLD) {
+      Serial.println("[ No Finger ] นิ้วหลุด");
+      histCount = 0;
+      histIndex = 0;
+      break;
+    }
+
+    // คำนวณใหม่
+    maxim_heart_rate_and_oxygen_saturation(
+      irBuffer, BUFFER_LENGTH, redBuffer,
+      &spo2, &validSPO2, &heartRate, &validHeartRate
+    );
+
+    // กรองและเก็บ history
+    bool bpmOK  = validHeartRate && heartRate >= 40 && heartRate <= 180;
+    bool spo2OK = validSPO2 && spo2 >= 85 && spo2 <= 100;
+
+    if (bpmOK && spo2OK) {
+      addHistory(heartRate, spo2);
+
+      Serial.println("--------------------");
+      Serial.print("BPM  : "); Serial.println((int)avgBPM());
+      Serial.print("SpO2 : "); Serial.print((int)avgSpO2());
+      Serial.println(" %");
+      Serial.println("--------------------");
+    }
+  }
+}
